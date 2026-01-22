@@ -1,0 +1,137 @@
+/******************** BLYNK INFO ********************/
+#define BLYNK_TEMPLATE_ID "TMPL3122"
+#define BLYNK_TEMPLATE_NAME "NeoHouse IoT"
+#define BLYNK_AUTH_TOKEN "82mHg-F4rph0527Fev74F37qLsYNvPQD"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+
+/******************** WIFI ********************/
+char ssid[] = "Teacher_Room";
+char pass[] = "Ncit@123";
+
+/******************** OUTPUT PINS ********************/
+#define LED1        2
+#define LED2        4
+#define BUZZER_PIN  26
+#define SMOKE_LED   33
+#define RELAY_MOTOR 34   // DC motor relay (ACTIVE LOW)
+
+/******************** INPUT PINS ********************/
+#define SMOKE_PIN 27     // MQ-2 DO pin
+#define DHTPIN    14
+
+/******************** DHT ********************/
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/******************** TIMER ********************/
+BlynkTimer timer;
+
+/******************** VARIABLES ********************/
+bool smokeDetected = false;
+unsigned long lastBlink = 0;
+bool smokeLedState = false;
+
+/******************** DHT FUNCTION ********************/
+void sendDHTData() {
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("❌ DHT11 read failed");
+    return;
+  }
+
+  Blynk.virtualWrite(V7, temperature);
+  Blynk.virtualWrite(V8, humidity);
+
+  Serial.print("🌡 Temp: ");
+  Serial.print(temperature);
+  Serial.print(" °C | 💧 Hum: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+}
+
+/******************** SMOKE CHECK ********************/
+void checkSmoke() {
+  int smokeValue = digitalRead(SMOKE_PIN);
+
+  // MQ-2: LOW = Smoke detected
+  if (smokeValue == LOW) {
+    if (!smokeDetected) Serial.println("🚨 SMOKE DETECTED!");
+    smokeDetected = true;
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    if (smokeDetected) Serial.println("✅ Smoke cleared");
+    smokeDetected = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(SMOKE_LED, LOW);
+    smokeLedState = false;
+  }
+}
+
+/******************** BLINK SMOKE LED ********************/
+void blinkSmokeLED() {
+  if (!smokeDetected) return;
+
+  if (millis() - lastBlink >= 300) {
+    smokeLedState = !smokeLedState;
+    digitalWrite(SMOKE_LED, smokeLedState);
+    lastBlink = millis();
+  }
+}
+
+/******************** BLYNK CONTROLS ********************/
+BLYNK_WRITE(V0) {  // LED1
+  digitalWrite(LED1, param.asInt());
+}
+
+BLYNK_WRITE(V1) {  // LED2
+  digitalWrite(LED2, param.asInt());
+}
+
+BLYNK_WRITE(V9) {  // DC Motor via relay
+  int motorState = param.asInt();
+
+  // Relay is ACTIVE LOW
+  digitalWrite(RELAY_MOTOR, motorState ? LOW : HIGH);
+
+  Serial.println(motorState ? "🟢 Motor ON" : "🔴 Motor OFF");
+}
+
+/******************** SETUP ********************/
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SMOKE_LED, OUTPUT);
+  pinMode(SMOKE_PIN, INPUT);
+  pinMode(RELAY_MOTOR, OUTPUT);
+
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(SMOKE_LED, LOW);
+  digitalWrite(RELAY_MOTOR, HIGH); // motor OFF
+
+  dht.begin();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(2000L, sendDHTData); // DHT
+  timer.setInterval(300L, checkSmoke);   // Smoke
+}
+
+/******************** LOOP ********************/
+void loop() {
+  Blynk.run();
+  timer.run();
+  blinkSmokeLED();
+}
