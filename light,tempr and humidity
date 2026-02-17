@@ -1,0 +1,77 @@
+#define BLYNK_TEMPLATE_ID "TMPL3122"
+#define BLYNK_TEMPLATE_NAME "NeoHouse IoT"
+#define BLYNK_AUTH_TOKEN "82mHg-F4rph0527Fev74F37qLsYNvPQD"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+#include <DHT.h>
+
+char ssid[] = "Teacher_Room";
+char pass[] = "Ncit@123";
+
+#define LED1 2
+#define LED2 4
+
+// -------- DHT11 Setup ----------
+#define DHTPIN 14        // DATA pin connected here
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+BlynkTimer timer;
+
+// Send DHT data to Blynk every 2 seconds
+void sendDHT() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature(); // Celsius
+
+  if (isnan(h) || isnan(t)) {
+    Serial.println("Failed to read from DHT11!");
+    return;
+  }
+
+  Blynk.virtualWrite(V7, t); // Temperature
+  Blynk.virtualWrite(V8, h); // Humidity
+
+  Serial.print("Temp: ");
+  Serial.print(t);
+  Serial.print(" °C  Hum: ");
+  Serial.print(h);
+  Serial.println(" %");
+}
+
+// Button V0 controls LED1
+BLYNK_WRITE(V0) {
+  int v = param.asInt();
+  digitalWrite(LED1, v);
+  Serial.println(v ? "LED1 ON" : "LED1 OFF");
+}
+
+// Button V1 controls LED2
+BLYNK_WRITE(V1) {
+  int v = param.asInt();
+  digitalWrite(LED2, v);
+  Serial.println(v ? "LED2 ON" : "LED2 OFF");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+
+  dht.begin();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(2000L, sendDHT); // 2 seconds
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}

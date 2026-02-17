@@ -1,0 +1,43 @@
+#define BLYNK_TEMPLATE_ID "TMPL3122"
+#define BLYNK_TEMPLATE_NAME "NeoHouse IoT"
+#define BLYNK_AUTH_TOKEN "82mHg-F4rph0527Fev74F37qLsYNvPQD"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "NCIT-OLD-RECEPTION";
+char pass[] = "Ncit@123";
+
+#define LED1 2
+#define LED2 4
+
+// Button V0 controls LED1
+BLYNK_WRITE(V0) {
+  int v = param.asInt();        // 0 or 1
+  digitalWrite(LED1, v);
+  Serial.println(v ? "LED1 ON" : "LED1 OFF");
+}
+
+// Button V1 controls LED2
+BLYNK_WRITE(V1) {
+  int v = param.asInt();
+  digitalWrite(LED2, v);
+  Serial.println(v ? "LED2 ON" : "LED2 OFF");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+}
+
+void loop() {
+  Blynk.run();
+}
