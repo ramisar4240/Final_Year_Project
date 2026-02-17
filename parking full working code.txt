@@ -1,0 +1,281 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+
+/* ---------------- OLED (0.96" SSD1306 I2C) ---------------- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+#define OLED_SDA 13
+#define OLED_SCL 14
+#define OLED_ADDR 0x3C   // if blank, try 0x3D
+
+/* ---------------- RFID (RC522) ---------------- */
+#define SS_PIN   21
+#define RST_PIN  22
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+/* ---------------- IR Sensors ---------------- */
+#define IR_ENTRY_PIN  34   // ENTRY IR OUT
+#define IR_EXIT_PIN   35   // EXIT IR OUT (ONLY COUNT)
+
+/* ---------------- Servo Gate (ENTRY GATE ONLY) ---------------- */
+#define SERVO_PIN  27
+Servo gate;
+const int GATE_CLOSE_ANGLE = 0;
+const int GATE_OPEN_ANGLE  = 90;
+
+const unsigned long RFID_TIMEOUT_MS = 8000;  // wait 8s for RFID after entry detected
+const unsigned long GATE_OPEN_MS    = 4000;  // gate open time
+
+/* ---------------- Buzzer + Gate LED ---------------- */
+#define BUZZER_PIN 26
+#define GATE_LED   32
+
+/* ---------------- Authorized Cards ---------------- */
+String authorizedCards[] = {
+  "06 4A F2 05",
+  "19 B0 77 06",
+  "6D 74 F1 05",
+  "73 60 73 06"
+};
+const int totalCards = 4;
+
+/* ---------------- Parking Count ---------------- */
+int carCount = 0;
+const int MAX_CARS = 4;   // change capacity
+
+/* ---------------- State ---------------- */
+bool waitingForCard = false;
+unsigned long waitStartMs = 0;
+
+bool gateIsOpen = false;
+unsigned long gateOpenMs = 0;
+
+/* Edge detection + cooldown */
+bool prevEntryState = HIGH;
+bool prevExitState  = HIGH;
+
+unsigned long lastEntryEventMs = 0;
+unsigned long lastExitEventMs  = 0;
+const unsigned long EVENT_COOLDOWN_MS = 1500;
+
+/* ---------------- Helpers ---------------- */
+void showStatus(const String &line1, const String &line2 = "", const String &line3 = "") {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println(line1);
+
+  if (line2.length()) { display.setCursor(0, 16); display.println(line2); }
+  if (line3.length()) { display.setCursor(0, 32); display.println(line3); }
+
+  display.setCursor(0, 52);
+  display.print("Cars: ");
+  display.print(carCount);
+  display.print("/");
+  display.print(MAX_CARS);
+
+  display.display();
+}
+
+void beep(int times, int durationMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(durationMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(120);
+  }
+}
+
+void longBeep() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(900);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+String uidToString() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+    if (i < rfid.uid.size - 1) uid += " ";
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+bool isAuthorized(const String &uid) {
+  for (int i = 0; i < totalCards; i++) {
+    if (uid == authorizedCards[i]) return true;
+  }
+  return false;
+}
+
+void clampCount() {
+  if (carCount < 0) carCount = 0;
+  if (carCount > MAX_CARS) carCount = MAX_CARS;
+}
+
+void openGate() {
+  gate.write(GATE_OPEN_ANGLE);
+  gateIsOpen = true;
+  gateOpenMs = millis();
+  digitalWrite(GATE_LED, HIGH);
+  beep(2, 120);
+}
+
+void closeGate() {
+  gate.write(GATE_CLOSE_ANGLE);
+  gateIsOpen = false;
+  digitalWrite(GATE_LED, LOW);
+}
+
+/* Detect ONE event (HIGH->LOW) with cooldown */
+bool fallingEdgeEvent(bool currentState, bool &prevState, unsigned long &lastEventMs) {
+  bool event = (prevState == HIGH && currentState == LOW);
+  prevState = currentState;
+
+  if (!event) return false;
+  if (millis() - lastEventMs < EVENT_COOLDOWN_MS) return false;
+
+  lastEventMs = millis();
+  return true;
+}
+
+/* ---------------- Setup ---------------- */
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(GATE_LED, OUTPUT);
+  digitalWrite(GATE_LED, LOW);
+
+  // ENTRY IR (GPIO34 input-only)
+  pinMode(IR_ENTRY_PIN, INPUT);
+
+  // EXIT IR (GPIO35 input-only) - use INPUT_PULLUP to help stability if sensor output is weak
+  pinMode(IR_EXIT_PIN, INPUT_PULLUP);
+
+  // OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("❌ OLED not found. Try OLED_ADDR=0x3D");
+    while (true) {}
+  }
+
+  showStatus("NeoHouse Parking", "Booting...");
+  delay(800);
+
+  // Servo (ENTRY gate)
+  gate.setPeriodHertz(50);
+  gate.attach(SERVO_PIN, 500, 2400);
+  closeGate();
+
+  // RFID
+  SPI.begin(18, 19, 23, SS_PIN);
+  rfid.PCD_Init();
+  delay(50);
+
+  byte v = rfid.PCD_ReadRegister(rfid.VersionReg);
+  Serial.print("RC522 Version: 0x");
+  Serial.println(v, HEX);
+
+  if (v == 0x00 || v == 0xFF) {
+    showStatus("RFID ERROR", "Check wiring");
+  } else {
+    showStatus("Smart Parking", "Car Dected", "ENTRY/EXIT Detect");
+  }
+
+  // init previous sensor states
+  prevEntryState = digitalRead(IR_ENTRY_PIN);
+  prevExitState  = digitalRead(IR_EXIT_PIN);
+}
+
+/* ---------------- Loop ---------------- */
+void loop() {
+  // Auto-close ENTRY gate + return to ready screen
+  if (gateIsOpen && (millis() - gateOpenMs >= GATE_OPEN_MS)) {
+    closeGate();
+    showStatus("Ready", "ENTRY/EXIT Detect", "");
+  }
+
+  // Read sensors
+  bool entryState = digitalRead(IR_ENTRY_PIN);
+  bool exitState  = digitalRead(IR_EXIT_PIN);
+
+  /* -------- EXIT EVENT -> ONLY COUNT REDUCE (NO GATE OPEN) -------- */
+  if (fallingEdgeEvent(exitState, prevExitState, lastExitEventMs)) {
+    if (carCount > 0) carCount--;
+    clampCount();
+
+    beep(1, 120);
+    showStatus("EXIT DETECTED", "Car Leaving...", "");
+    delay(1200);
+
+    showStatus("Ready", "ENTRY/EXIT Detect", "");
+    return;
+  }
+
+  /* -------- ENTRY EVENT -> wait RFID -------- */
+  if (!waitingForCard && !gateIsOpen && fallingEdgeEvent(entryState, prevEntryState, lastEntryEventMs)) {
+
+    if (carCount >= MAX_CARS) {
+      longBeep();
+      showStatus("PARKING FULL", "Entry Blocked");
+      delay(900);
+      showStatus("Ready", "ENTRY/EXIT Detect", "");
+      return;
+    }
+
+    waitingForCard = true;
+    waitStartMs = millis();
+    beep(1, 120);
+    showStatus("ENTRY", "Scan RFID Card", "Time: 8s");
+  }
+
+  // Timeout waiting for RFID
+  if (waitingForCard && (millis() - waitStartMs > RFID_TIMEOUT_MS)) {
+    waitingForCard = false;
+    showStatus("TIME OUT", "No card scanned");
+    delay(900);
+    showStatus("Ready", "ENTRY/EXIT Detect", "");
+  }
+
+  // Read RFID only when waiting
+  if (!waitingForCard) return;
+
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  String uid = uidToString();
+  Serial.print("UID: ");
+  Serial.println(uid);
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  if (isAuthorized(uid)) {
+    waitingForCard = false;
+
+    carCount++;
+    clampCount();
+
+    showStatus("ACCESS GRANTED", "Gate OPEN", uid);
+    openGate();
+  } else {
+    longBeep();
+    showStatus("ACCESS DENIED", "Wrong Card", uid);
+    delay(1200);
+    showStatus("Scan RFID Card", "Try again");
+  }
+}

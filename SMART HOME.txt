@@ -1,0 +1,234 @@
+/******************** BLYNK INFO ********************/
+#define BLYNK_TEMPLATE_ID "TMPL3122"
+#define BLYNK_TEMPLATE_NAME "NeoHouse IoT"
+#define BLYNK_AUTH_TOKEN "82mHg-F4rph0527Fev74F37qLsYNvPQD"
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+
+/******************** WIFI ********************/
+char ssid[] = "ENGINEER";
+char pass[] = "Engineer@1234";
+
+/******************** OUTPUT PINS ********************/
+// LEDs (Lights)
+#define LED1  16
+#define LED2  17
+#define LED3  25      // Extra light (Blynk V13)
+#define LED4  18      // NEW light (Blynk V3)
+#define LED5  22      // NEW light (Blynk V4)
+
+#define BUZZER_PIN  26
+#define SMOKE_LED   33
+
+#define RELAY_MOTOR 32   // ✅ ACTIVE LOW relay (Fan/DC motor)
+
+/******************** INPUT PINS ********************/
+#define SMOKE_PIN   27   // MQ-2 DO pin (LOW = smoke detected)
+
+// DHT11 (if you face read fail on GPIO14, change to GPIO16 and connect DATA to 16)
+#define DHTPIN      14
+#define DHTTYPE     DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/******************** SERVO ********************/
+#define SERVO_PIN   13
+Servo fanServo;
+
+bool fanDemoOn = false;
+int fanSpeed = 10;       // Slider V12: 1..20 (bigger = faster)
+int angle = 90;
+int stepDir = 1;
+
+/******************** TIMER ********************/
+BlynkTimer timer;
+
+/******************** SMOKE VARIABLES ********************/
+bool smokeDetected = false;
+unsigned long smokeBootMs = 0;
+int smokeLowCount = 0;
+
+const unsigned long SMOKE_WARMUP_MS = 60000; // 60 sec warm-up
+const int SMOKE_CONFIRM_COUNT = 5;           // 5 LOW reads = real smoke
+
+/******************** DHT FUNCTION ********************/
+void sendDHTData() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    Serial.println("❌ DHT11 read failed");
+    return;
+  }
+
+  Blynk.virtualWrite(V7, t);
+  Blynk.virtualWrite(V8, h);
+
+  Serial.print("🌡 Temp: "); Serial.print(t);
+  Serial.print(" °C | 💧 Hum: "); Serial.print(h);
+  Serial.println(" %");
+}
+
+/******************** SMOKE CHECK (ONLY THEN BUZZER + BLINK) ********************/
+void checkSmoke() {
+
+  // Warm-up ignore
+  if (millis() - smokeBootMs < SMOKE_WARMUP_MS) {
+    Blynk.virtualWrite(V11, "WARMING UP...");
+    smokeDetected = false;
+    smokeLowCount = 0;
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(SMOKE_LED, LOW);
+    return;
+  }
+
+  int smokeValue = digitalRead(SMOKE_PIN);
+
+  // Most MQ-2 DO: LOW = smoke
+  if (smokeValue == LOW) smokeLowCount++;
+  else smokeLowCount = 0;
+
+  // Confirm smoke
+  if (smokeLowCount >= SMOKE_CONFIRM_COUNT) {
+
+    if (!smokeDetected) {
+      Serial.println("🚨 SMOKE DETECTED!");
+      Blynk.virtualWrite(V11, "SMOKE DETECTED");
+    }
+
+    smokeDetected = true;
+    digitalWrite(BUZZER_PIN, HIGH); // buzzer ON
+
+  } else {
+
+    if (smokeDetected) {
+      Serial.println("✅ Smoke cleared");
+      Blynk.virtualWrite(V11, "NORMAL");
+    }
+
+    smokeDetected = false;
+    digitalWrite(BUZZER_PIN, LOW);  // buzzer OFF
+    digitalWrite(SMOKE_LED, LOW);   // LED OFF
+  }
+}
+
+/******************** BLINK SMOKE LED (ONLY WHEN SMOKE) ********************/
+void blinkSmokeLED() {
+  if (!smokeDetected) return;
+
+  static unsigned long lastBlinkTime = 0;
+  static bool ledState = false;
+
+  if (millis() - lastBlinkTime > 300) {
+    ledState = !ledState;
+    digitalWrite(SMOKE_LED, ledState);
+    lastBlinkTime = millis();
+  }
+}
+
+/******************** SERVO FAN SWING DEMO ********************/
+void fanSwing() {
+  if (!fanDemoOn) return;
+
+  const int MIN_ANGLE = 30;
+  const int MAX_ANGLE = 150;
+
+  angle += stepDir * fanSpeed;
+
+  if (angle >= MAX_ANGLE) { angle = MAX_ANGLE; stepDir = -1; }
+  if (angle <= MIN_ANGLE) { angle = MIN_ANGLE; stepDir =  1; }
+
+  fanServo.write(angle);
+}
+
+/******************** BLYNK CONTROLS ********************/
+BLYNK_WRITE(V16) { digitalWrite(LED1, param.asInt()); }  // LED1
+BLYNK_WRITE(V17) { digitalWrite(LED2, param.asInt()); }  // LED2
+
+// LED3 switch uses V13 (as in your code)
+BLYNK_WRITE(V13) { digitalWrite(LED3, param.asInt()); } // LED3
+
+// ✅ NEW switches for LED4 and LED5
+BLYNK_WRITE(V14) { digitalWrite(LED4, param.asInt()); }  // LED4
+BLYNK_WRITE(V15) { digitalWrite(LED5, param.asInt()); }  // LED5
+
+BLYNK_WRITE(V9) {  // Relay fan/motor ON/OFF (ACTIVE LOW)
+  int motorState = param.asInt();
+  digitalWrite(RELAY_MOTOR, motorState ? LOW : HIGH);
+  Serial.println(motorState ? "🟢 Fan Relay ON" : "🔴 Fan Relay OFF");
+}
+
+BLYNK_WRITE(V6) {  // Servo swing ON/OFF
+  fanDemoOn = param.asInt();
+  if (!fanDemoOn) {
+    angle = 90; stepDir = 1;
+    fanServo.write(90);
+  }
+  Serial.println(fanDemoOn ? "🌀 Servo Swing ON" : "⛔ Servo Swing OFF");
+}
+
+BLYNK_WRITE(V12) { // Servo speed 1..20
+  fanSpeed = constrain(param.asInt(), 1, 20);
+  Serial.print("Servo swing speed = ");
+  Serial.println(fanSpeed);
+}
+
+/******************** SETUP ********************/
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  pinMode(LED4, OUTPUT);
+  pinMode(LED5, OUTPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SMOKE_LED, OUTPUT);
+
+  pinMode(RELAY_MOTOR, OUTPUT);
+
+  // ✅ Prevent floating noise on MQ-2 DO
+  pinMode(SMOKE_PIN, INPUT_PULLUP);
+
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+  digitalWrite(LED4, LOW);
+  digitalWrite(LED5, LOW);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(SMOKE_LED, LOW);
+
+  // Relay OFF at start (ACTIVE LOW)
+  digitalWrite(RELAY_MOTOR, HIGH);
+
+  dht.begin();
+  delay(2000); // ✅ DHT first stable read
+
+  // Servo setup
+  fanServo.setPeriodHertz(50);
+  fanServo.attach(SERVO_PIN, 500, 2400);
+  fanServo.write(90);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // Smoke warm-up start
+  smokeBootMs = millis();
+  Blynk.virtualWrite(V11, "WARMING UP...");
+
+  timer.setInterval(2000L, sendDHTData);
+  timer.setInterval(300L, checkSmoke);
+  timer.setInterval(120L, fanSwing);
+}
+
+/******************** LOOP ********************/
+void loop() {
+  Blynk.run();
+  timer.run();
+  blinkSmokeLED();
+}
